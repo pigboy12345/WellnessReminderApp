@@ -1,0 +1,27 @@
+# Environment variables (sensitive credentials)
+.env
+
+# Local runtime artifacts
+logs/*.log
+*.log
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+dist/
+build/
+*.spec
+
+# Virtual environment
+venv/
+.venv/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Data files (can contain private content)
+data/*.xlsx
+
