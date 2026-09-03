@@ -157,7 +157,7 @@ root.mainloop()
 
         if self.media_popup_enabled and reminder.icon and self._is_media_path(reminder.icon):
             try:
-                # self._show_video_toast(reminder.icon)
+                # self._show_video_toast(reminder.icon) # for pop-up video toast
                 logger.info("Video toast displayed for ReminderId=%s", reminder.id)
             except Exception:
                 logger.exception("Video toast fallback failed for ReminderId=%s", reminder.id)
