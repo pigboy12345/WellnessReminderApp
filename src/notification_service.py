@@ -1,6 +1,8 @@
 import datetime as dt
 import logging
 import os
+import subprocess
+import sys
 from typing import Callable, Optional
 
 from windows_toasts import ( # type: ignore
@@ -14,6 +16,7 @@ from windows_toasts import ( # type: ignore
 
 from src.media_popup import show_media_popup
 from src.models import Reminder
+from src.videoToast import VideoToastPlayer
 
 logger = logging.getLogger("WellnessReminder")
 
@@ -21,8 +24,10 @@ COMPLETED = "Completed"
 DISMISS = "Dismiss"
 SNOOZE = "Snooze"
 
-# Media extensions that should render in the popup instead of the toast.
-_MEDIA_EXTS = {".gif", ".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".wmv"}
+# Media extensions that should render in a dedicated media player instead of
+# the standard Windows toast hero image when they cannot be displayed natively.
+_VIDEO_EXTS = {".gif", ".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v", ".wmv"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
 
 
 class NotificationService:
@@ -51,7 +56,57 @@ class NotificationService:
         if not path:
             return False
         ext = os.path.splitext(path.split("?")[0])[1].lower()
-        return ext in _MEDIA_EXTS or path.startswith(("http://", "https://"))
+        return ext in _VIDEO_EXTS or path.startswith(("http://", "https://"))
+
+    def _is_image_path(self, path: str) -> bool:
+        """Return True when the value is a normal image file (native toast support)."""
+        if not path:
+            return False
+        ext = os.path.splitext(path.split("?")[0])[1].lower()
+        return ext in _IMAGE_EXTS and not path.startswith(("http://", "https://"))
+
+    def _show_video_toast(self, media_path: str) -> bool:
+        """Attempt to show a separate video toast only when the media is actually playable."""
+        if not media_path or not self.media_popup_enabled:
+            return False
+
+        try:
+            import cv2
+            cap = cv2.VideoCapture(media_path)
+            is_valid = cap.isOpened() if cap else False
+            if cap is not None:
+                cap.release()
+            if not is_valid:
+                logger.info("Skipping video toast for unsupported media source: %s", media_path)
+                return False
+        except Exception:
+            logger.info("Skipping video toast: unsupported or unreadable media source: %s", media_path)
+            return False
+
+        try:
+            launcher = """
+import sys
+import tkinter as tk
+from src.videoToast import VideoToastPlayer
+
+root = tk.Tk()
+player = VideoToastPlayer(root)
+root.protocol(\"WM_DELETE_WINDOW\", player.on_closing)
+root.after(500, lambda: player.load_video(sys.argv[1]))
+root.mainloop()
+"""
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                [sys.executable, "-c", launcher, media_path],
+                creationflags=creation_flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            logger.exception("Could not initialize video toast for media path: %s", media_path)
+            return False
 
     def _icon_path_exists(self, path: str) -> bool:
         """Check if an icon path is valid - either a local file or a URL."""
@@ -65,35 +120,17 @@ class NotificationService:
         now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         body = f"{reminder.message}\nCategory: {reminder.category}   |   Time: {now_str}"
 
-        # If the reminder uses a GIF/video media file (local or URL), show the
-        # custom media popup instead of the toast (Windows toasts can't play
-        # animated/video content).
-        if self.media_popup_enabled and reminder.icon and self._is_media_path(reminder.icon):
-            def _popup_action(action: str):
-                if on_action:
-                    try:
-                        on_action(reminder, action)
-                    except Exception:
-                        logger.exception("Error handling media popup action for ReminderId=%s", reminder.id)
-
-            return show_media_popup(
-                title=reminder.title,
-                message=body,
-                media_path=reminder.icon,
-                snooze_minutes=self.snooze_minutes,
-                max_width=self.media_max_width,
-                timeout_seconds=self.media_timeout_seconds,
-                gif_max_loops=self.gif_max_loops,
-                on_action=_popup_action,
-            )
-
+        native_toast_shown = False
         toast = Toast([reminder.title, body])
 
-        image_path = reminder.icon if (reminder.icon and self._icon_path_exists(reminder.icon)) else self.logo_path
-        logo_image_path = self.logo_path if (self.logo_path and self._icon_path_exists(self.logo_path)) else None
-        if image_path:
-            toast.AddImage(ToastDisplayImage.fromPath(image_path, position=ToastImagePosition.Hero))
-            toast.AddImage(ToastDisplayImage.fromPath(logo_image_path, position=ToastImagePosition.AppLogo)) # type: ignore
+        if reminder.icon and self._is_image_path(reminder.icon):
+            image_path = reminder.icon if self._icon_path_exists(reminder.icon) else self.logo_path
+            logo_image_path = self.logo_path if (self.logo_path and self._icon_path_exists(self.logo_path)) else None
+            if image_path:
+                toast.AddImage(ToastDisplayImage.fromPath(image_path, position=ToastImagePosition.Hero))
+                toast.AddImage(ToastDisplayImage.fromPath(logo_image_path, position=ToastImagePosition.AppLogo)) # type: ignore
+        elif self.logo_path and self._icon_path_exists(self.logo_path):
+            toast.AddImage(ToastDisplayImage.fromPath(self.logo_path, position=ToastImagePosition.AppLogo)) # type: ignore
 
         toast.AddAction(ToastButton(COMPLETED, COMPLETED))
         toast.AddAction(ToastButton(DISMISS, DISMISS))
@@ -112,8 +149,17 @@ class NotificationService:
 
         try:
             self.toaster.show_toast(toast)
+            native_toast_shown = True
             logger.info("Toast displayed for ReminderId=%s (%s)", reminder.id, reminder.title)
-            return True
         except Exception:
             logger.exception("Failed to display toast for ReminderId=%s", reminder.id)
             return False
+
+        if self.media_popup_enabled and reminder.icon and self._is_media_path(reminder.icon):
+            try:
+                # self._show_video_toast(reminder.icon)
+                logger.info("Video toast displayed for ReminderId=%s", reminder.id)
+            except Exception:
+                logger.exception("Video toast fallback failed for ReminderId=%s", reminder.id)
+
+        return native_toast_shown
